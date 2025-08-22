@@ -75,7 +75,7 @@ async function handleTelegramUpdate(env, update) {
   if (!msg || !msg.text) return new Response("ok");
 
   const text = msg.text.trim();
-  const m = text.match(/^\/c\s+([0-9]*\.?[0-9]+)\s+([a-z0-9]+)\s+([a-z0-9]+)$/i);
+  const m = text.match(/^\/c(?:@\w+)?\s+([0-9]*\.?[0-9]+)\s+([a-z0-9]+)\s+([a-z0-9]+)$/i);
   if (!m) return new Response("ok"); // ignore others
 
   const amt = parseFloat(m[1]);
@@ -124,6 +124,10 @@ async function tgReply(env, chatId, text) {
 
 export default {
   async fetch(request, env) {
+    if (!env.TELEGRAM_BOT_TOKEN) {
+      // Makes it obvious in logs if the secret is missing
+      return new Response("Missing TELEGRAM_BOT_TOKEN", { status: 500 });
+    }
     if (request.method === "POST") {
       const update = await request.json();
       return await handleTelegramUpdate(env, update);
@@ -131,3 +135,4 @@ export default {
     return new Response("Telegram /c bot is running.");
   }
 };
+
