@@ -1,0 +1,3 @@
+name = "telegram-crypto-bot"
+main = "src/index.js"
+compatibility_date = "2025-08-22"
