@@ -76,7 +76,11 @@ async function handleTelegramUpdate(env, update) {
 
   const text = msg.text.trim();
   const m = text.match(/^\/c(?:@\w+)?\s+([0-9]*\.?[0-9]+)\s+([a-z0-9]+)\s+([a-z0-9]+)$/i);
-  if (!m) return new Response("ok"); // ignore others
+  if (!m) {
+  // TEMP: reply so we know the bot/token works at all
+  try { await tgReply(env, msg.chat.id, "Bot is alive. Use: /c <amount> <coin1> <coin2>"); } catch {}
+  return new Response("ok");
+}
 
   const amt = parseFloat(m[1]);
   const baseSym = m[2];
