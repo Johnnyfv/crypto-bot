@@ -114,13 +114,23 @@ async function handleTelegramUpdate(env, update) {
 
 async function tgReply(env, chatId, text) {
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
+  const body = { chat_id: chatId, text, parse_mode: "Markdown" };
+  const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" })
+    body: JSON.stringify(body)
   });
+  // Log Telegram's response if anything goes wrong
+  if (!r.ok) {
+    const t = await r.text();
+    console.log("sendMessage failed", r.status, t);
+  } else {
+    const j = await r.json();
+    if (!j.ok) console.log("sendMessage JSON not ok", j);
+  }
   return new Response("ok");
 }
+
 
 export default {
   async fetch(request, env) {
