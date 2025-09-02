@@ -1,7 +1,28 @@
 // Telegram Crypto Convert Bot (Webhook) — Cloudflare Workers (Free)
 // Trigger: /c <amount> <coin1> <coin2>
 // Examples: /c 2 btc usd   |   /c 0.5 eth btc
+// ----- Idempotency & dedupe (protect against Telegram retries/dupes) -----
+const seenUpdates = new Set();          // update_id
+const seenMessages = new Set();         // chat_id:message_id
+const lastReplyHashByChat = new Map();  // chat_id -> { textHash, until }
 
+// Keep memory tidy
+function remember(setOrMap, key, ttlMs = 30_000) {  // 30s default
+  setOrMap.add ? setOrMap.add(key) : setOrMap.set(key, true);
+  setTimeout(() => {
+    setOrMap.delete(key);
+  }, ttlMs);
+}
+
+// Prevent sending *identical* reply text twice in a short window (rare edge)
+function sameReplyRecently(chatId, text, ttlMs = 5_000) {
+  const now = Date.now();
+  const prev = lastReplyHashByChat.get(chatId);
+  const hash = `${text.length}:${text.slice(0,64)}`; // cheap content hash
+  if (prev && prev.textHash === hash && now < prev.until) return true;
+  lastReplyHashByChat.set(chatId, { textHash: hash, until: now + ttlMs });
+  return false;
+}
 const FIAT = new Set([
   "usd","eur","gbp","jpy","cny","aud","cad","chf","inr","brl","mxn","sek","nok","dkk",
   "pln","zar","hkd","sgd","thb","twd","idr","php","try","ils","nzd","rub","aed","sar",
@@ -71,6 +92,39 @@ async function geckoPrice(ids, vs) {
 }
 
 async function handleTelegramUpdate(env, update) {
+  // 0) Pick the message, ignore other update kinds
+const msg = update.message || update.edited_message;
+if (!msg || !msg.text) return new Response("ok");
+
+// 1) Update-level dedupe (retries / double deliver)
+if (typeof update.update_id === "number") {
+  if (seenUpdates.has(update.update_id)) return new Response("ok");
+  remember(seenUpdates, update.update_id, 60_000); // remember for 60s
+}
+
+// 2) Message-level dedupe (message & edited_message both delivered)
+const msgKey = `${msg.chat.id}:${msg.message_id}`;
+if (seenMessages.has(msgKey)) return new Response("ok");
+remember(seenMessages, msgKey, 60_000);
+ const text = (msg.text || "").trim().replace(/\u00A0/g, " "); // normalize weird spaces
+if (!text.toLowerCase().startsWith("/c")) return new Response("ok");
+
+// allow /c or /c@YourBot
+const parts = text.split(/\s+/);
+const mention = (parts[0].split("@")[1] || "").toLowerCase();
+if (mention && env.BOT_USERNAME && mention !== env.BOT_USERNAME.toLowerCase()) {
+  return new Response("ok"); // addressed to another bot
+}
+if (parts.length < 4) return new Response("ok");
+
+const amtStr = parts[1];
+if (/,/.test(amtStr)) return new Response("ok"); // your no-commas rule
+const amt = Number(amtStr);
+if (!isFinite(amt)) return new Response("ok");
+
+const baseSym  = parts[2];
+const quoteSym = parts[3];
+  
   const msg = update.message || update.edited_message;
   if (!msg || !msg.text) return new Response("ok");
 
@@ -116,23 +170,51 @@ async function handleTelegramUpdate(env, update) {
   }
 }
 
+// ----- Telegram reply with 429 backoff + duplicate-text suppression -----
+const cooldownByChat = new Map();
+const inCooldown = id => Date.now() < (cooldownByChat.get(id) || 0);
+
 async function tgReply(env, chatId, text) {
+  // Skip if chat is cooling down or we already sent same text moments ago
+  if (inCooldown(chatId)) return new Response("ok");
+  if (sameReplyRecently(chatId, text)) return new Response("ok");
+
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const body = { chat_id: chatId, text, parse_mode: "Markdown" };
+  const body = { chat_id: chatId, text }; // plain text is safest under load
+
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
-  // Log Telegram's response if anything goes wrong
+
   if (!r.ok) {
-    const t = await r.text();
-    console.log("sendMessage failed", r.status, t);
+    const raw = await r.text().catch(() => "");
+    let retrySec = 2;
+
+    // Parse Telegram's structured 429 if present
+    try {
+      const err = JSON.parse(raw);
+      if (err?.parameters?.retry_after) retrySec = Math.max(1, +err.parameters.retry_after);
+    } catch {}
+    // Fallback: "retry after X" in description
+    const m = /retry after (\d+)/i.exec(raw);
+    if (m) retrySec = Math.max(retrySec, parseInt(m[1], 10));
+
+    if (r.status === 429) {
+      cooldownByChat.set(chatId, Date.now() + retrySec * 1000);
+      console.log("sendMessage 429; cooling chat", chatId, "for", retrySec, "s");
+      return new Response("ok");
+    }
+
+    console.log("sendMessage failed", r.status, raw.slice(0, 300));
   } else {
-    const j = await r.json();
-    if (!j.ok) console.log("sendMessage JSON not ok", j);
+    const j = await r.json().catch(() => null);
+    if (!j?.ok) console.log("sendMessage JSON not ok", j);
   }
+
   return new Response("ok");
+}
 }
 
 
