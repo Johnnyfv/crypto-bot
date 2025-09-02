@@ -2,7 +2,7 @@
 // Trigger: /c <amount> <coin1> <coin2>
 // Examples: /c 2 btc usd   |   /c 0.5 eth btc
 
-// --------- config / constants ---------
+// --------- config / constants ----------
 const FIAT = new Set([
   "usd","eur","gbp","jpy","cny","aud","cad","chf","inr","brl","mxn","sek","nok","dkk",
   "pln","zar","hkd","sgd","thb","twd","idr","php","try","ils","nzd","rub","aed","sar",
