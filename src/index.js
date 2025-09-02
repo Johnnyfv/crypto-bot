@@ -2,6 +2,9 @@
 // Trigger: /c <amount> <coin1> <coin2>
 // Examples: /c 2 btc usd   |   /c 0.5 eth btc
 
+// Disable hitting CoinGecko /coins/list (prevents rate limits)
+const ALLOW_CG_LIST = false;
+
 // --------- config / constants ----------
 const FIAT = new Set([
   "usd","eur","gbp","jpy","cny","aud","cad","chf","inr","brl","mxn","sek","nok","dkk",
@@ -36,7 +39,15 @@ const COMMON = {
   ksm: "kusama", one: "harmony",
   celo: "celo", bat: "basic-attention-token",
   zrx: "0x", omg: "omisego",
+  // stables + common majors (examples)
+  usdc: "usd-coin",
+  usdt: "tether",
+  dai:  "dai",
+  tusd: "true-usd",
+  usde: "ethena-usde",
 
+
+  
   // Layer 2s / newer
   sui: "sui", sei: "sei-network",
   inj: "injective-protocol", dydx: "dydx",
@@ -134,16 +145,25 @@ async function loadCoinList() {
   return COIN_LIST;
 }
 
-async function symbolToId(sym) {
+async function symbolToId(env, sym) {
   const s = nrm(sym);
   if (!s) return null;
+
+  // 1) Direct alias hit (fast path, no API calls)
   if (COMMON[s]) return COMMON[s];
-  const list = await loadCoinList();
+
+   // 3) Hard stop if list is disabled (prevents 429s)
+  if (!ALLOW_CG_LIST) return null;
+
+  // 4) Fallback to list lookup (ONLY if explicitly enabled)
+  const list = await loadCoinList(env); // your existing list loader
   let m = list.filter(c => nrm(c.symbol) === s);
   if (m.length === 0) m = list.filter(c => nrm(c.name) === s);
   if (m.length === 0) return null;
   m.sort((a,b) => (a.name?.length||999) - (b.name?.length||999));
-  return m[0].id;
+  const id = m[0].id;
+  if (env.COINMAP) await env.COINMAP.put(`sym:${s}`, id, { expirationTtl: 7*24*60*60 });
+  return id;
 }
 
 async function geckoPrice(ids, vs) {
