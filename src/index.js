@@ -145,25 +145,16 @@ async function loadCoinList() {
   return COIN_LIST;
 }
 
-async function symbolToId(env, sym) {
+async function symbolToId(sym) {
   const s = nrm(sym);
   if (!s) return null;
-
-  // 1) Direct alias hit (fast path, no API calls)
   if (COMMON[s]) return COMMON[s];
-
-   // 3) Hard stop if list is disabled (prevents 429s)
-  if (!ALLOW_CG_LIST) return null;
-
-  // 4) Fallback to list lookup (ONLY if explicitly enabled)
-  const list = await loadCoinList(env); // your existing list loader
+  const list = await loadCoinList();
   let m = list.filter(c => nrm(c.symbol) === s);
   if (m.length === 0) m = list.filter(c => nrm(c.name) === s);
   if (m.length === 0) return null;
   m.sort((a,b) => (a.name?.length||999) - (b.name?.length||999));
-  const id = m[0].id;
-  if (env.COINMAP) await env.COINMAP.put(`sym:${s}`, id, { expirationTtl: 7*24*60*60 });
-  return id;
+  return m[0].id;
 }
 
 async function geckoPrice(ids, vs) {
