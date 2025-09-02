@@ -7,7 +7,7 @@ function nrm(s) { return String(s ?? "").toLowerCase().trim(); }
 function upper(s) { return String(s ?? "").toUpperCase().trim(); }
 const now = () => Date.now();
 
-// Small optional alias map (helps with odd tickers / synonyms).
+// Small optional alias map
 const ALIAS = {
   xbt: "btc",
   wif: "wif",
@@ -19,7 +19,7 @@ const ALIAS = {
   dai:  "dai",
 };
 
-// Simple number formatting: quote is a symbol (e.g., usdt/usdc/eth)
+// Simple number formatting (quote influences decimals)
 function fmt(num, quote) {
   const x = Number(num);
   const q = nrm(quote);
@@ -93,7 +93,7 @@ async function binancePrice(base, quote) {
   throw lastErr || new Error("binance failed");
 }
 
-// KuCoin Level1 (public, no key). Symbol like BTC-USDT. Returns price of 1 BASE in QUOTE.
+// KuCoin Level1 (public, no key). Symbol like BTC-USDT.
 async function kucoinPrice(base, quote) {
   const symbol = `${upper(base)}-${upper(quote)}`;
   const r = await fetch(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${symbol}`, {
@@ -127,7 +127,7 @@ async function ccPrice(env, base, quote) {
   return p;
 }
 
-// Tiny in-memory cache & Binance cooldown
+// Tiny cache & Binance cooldown
 const PRICE_CACHE = new Map(); // key -> { t, v }
 const PRICE_TTL_MS = 30_000;
 let BINANCE_COOLDOWN_UNTIL = 0;
@@ -136,7 +136,7 @@ const coolBinance = ms => { BINANCE_COOLDOWN_UNTIL = Math.max(BINANCE_COOLDOWN_U
 function cacheGet(key) { const e = PRICE_CACHE.get(key); return e && (now() - e.t) < PRICE_TTL_MS ? e.v : null; }
 function cachePut(key, v) { PRICE_CACHE.set(key, { t: now(), v }); }
 
-// Core: get price of 1 BASE in QUOTE, trying direct, then pivot via USDT, then fallbacks.
+// Core: price of 1 BASE in QUOTE
 async function getPriceBaseQuote(env, base, quote) {
   base = nrm(ALIAS[base] || base);
   quote = nrm(ALIAS[quote] || quote);
@@ -145,61 +145,55 @@ async function getPriceBaseQuote(env, base, quote) {
   const c = cacheGet(key);
   if (c) return c;
 
-  // 1) Binance direct (rotating hosts) unless cooling
-  if (!inBinanceCooldown()) {
-    try {
-      const p = await binancePrice(base, quote);
-      cachePut(key, p); return p;
-    } catch (e) {
-      if (!(e && e.code === "SYMBOL_MISSING")) coolBinance(20_000);
-    }
-  }
-
-  // 2) Binance pivot via USDT
   const pivot = "usdt";
-  if (base !== pivot && quote !== pivot && !inBinanceCooldown()) {
-    try {
-      const pBase = await binancePrice(base, pivot);
-      const pQuote = await binancePrice(quote, pivot);
-      if (isFinite(pBase) && isFinite(pQuote) && pBase > 0 && pQuote > 0) {
-        const rate = pBase / pQuote;
-        cachePut(key, rate); return rate;
+
+  // --- Helper to try a sequence of providers for a pair ---
+  async function tryDirect(b, q) {
+    // Binance direct
+    if (!inBinanceCooldown()) {
+      try {
+        return await binancePrice(b, q);
+      } catch (e) {
+        if (!(e && e.code === "SYMBOL_MISSING")) coolBinance(20_000);
       }
-    } catch (e) {
-      if (!(e && e.code === "SYMBOL_MISSING")) coolBinance(20_000);
     }
+    // KuCoin direct
+    try { return await kucoinPrice(b, q); } catch {}
+    // CC direct
+    try { return await ccPrice(env, b, q); } catch {}
+    throw new Error("direct_failed");
   }
 
-  // 2.5) KuCoin direct
+  // --- Cases ---
   try {
-    const p = await kucoinPrice(base, quote);
-    cachePut(key, p); return p;
-  } catch {}
+    // A) If quote == USDT: simple direct (e.g., BTC/USDT)
+    if (quote === pivot && base !== pivot) {
+      const p = await tryDirect(base, quote);
+      cachePut(key, p); return p;
+    }
 
-  // 2.6) KuCoin pivot via USDT
-  try {
-    if (base !== pivot && quote !== pivot) {
-      const pBase = await kucoinPrice(base, pivot);
-      const pQuote = await kucoinPrice(quote, pivot);
-      if (isFinite(pBase) && isFinite(pQuote) && pBase > 0 && pQuote > 0) {
-        const rate = pBase / pQuote;
-        cachePut(key, rate); return rate;
+    // B) If base == USDT: invert QUOTE/USDT (i.e., 1 USDT in QUOTE)
+    if (base === pivot && quote !== pivot) {
+      const pQuote = await tryDirect(quote, pivot); // price of 1 QUOTE in USDT
+      if (isFinite(pQuote) && pQuote > 0) {
+        const inv = 1 / pQuote;                     // price of 1 USDT in QUOTE
+        cachePut(key, inv); return inv;
       }
     }
-  } catch {}
 
-  // 3) CryptoCompare direct
-  try {
-    const p = await ccPrice(env, base, quote);
-    cachePut(key, p); return p;
-  } catch {}
+    // C) Neither side is USDT: try direct, then pivot via USDT
+    //    rate = (BASE/USDT) / (QUOTE/USDT)
+    try {
+      const p = await tryDirect(base, quote);
+      cachePut(key, p); return p;
+    } catch {}
 
-  // 4) CryptoCompare pivot via USDT
-  try {
-    const pBase = await ccPrice(env, base, pivot);
-    const pQuote = await ccPrice(env, quote, pivot);
-    const rate = pBase / pQuote;
-    if (isFinite(rate) && rate > 0) { cachePut(key, rate); return rate; }
+    const pBase = await tryDirect(base, pivot);
+    const pQuote = await tryDirect(quote, pivot);
+    if (isFinite(pBase) && isFinite(pQuote) && pBase > 0 && pQuote > 0) {
+      const rate = pBase / pQuote;
+      cachePut(key, rate); return rate;
+    }
   } catch {}
 
   throw new Error("no price route");
@@ -243,6 +237,24 @@ async function tgReply(env, chatId, text) {
 }
 
 // ======================= Update Handler =======================
+const HELP_TEXT =
+`Crypto Convert Bot
+
+Usage:
+/c <amount> <base> <quote>
+
+Examples:
+/c 1 btc usdt
+/c 5 eth btc
+/c 10 sol usdc
+
+Notes:
+• No commas in the amount
+• Works in groups and DMs
+
+Support the bot:
+https://cwallet.com/t/1PYNYSIY`;
+
 async function handleTelegramUpdate(env, update) {
   const msg = update.message || update.edited_message;
   if (!msg || !msg.text) return new Response("ok");
@@ -267,7 +279,15 @@ async function handleTelegramUpdate(env, update) {
   const cmd = parts[0].toLowerCase();
 
   // Accept /c or /c@YourBot
-  if (!cmd.startsWith("/c")) return new Response("ok");
+  const isC = cmd.startsWith("/c");
+  const isHelp = cmd === "/help" || cmd.startsWith("/help@");
+  const isStart = cmd === "/start" || cmd.startsWith("/start@");
+
+  if (isHelp || isStart) {
+    return await tgReply(env, msg.chat.id, HELP_TEXT);
+  }
+
+  if (!isC) return new Response("ok");
   const mention = (cmd.split("@")[1] || "").toLowerCase();
   if (mention && env.BOT_USERNAME && mention !== env.BOT_USERNAME.toLowerCase()) {
     return new Response("ok");
@@ -275,11 +295,7 @@ async function handleTelegramUpdate(env, update) {
 
   // Help if not enough args
   if (parts.length < 4) {
-    return await tgReply(
-      env,
-      msg.chat.id,
-      "Usage:\n\n/c <amount> <base coin> <quote coin>\n\nExamples:\n/c 1 btc usdt\n/c 5 eth btc\n/c 10 sol usdc\n\nNotes:\n• No commas in the amount\n• Works in groups and DMs"
-    );
+    return await tgReply(env, msg.chat.id, HELP_TEXT);
   }
 
   // No-commas rule + amount parse
@@ -295,7 +311,6 @@ async function handleTelegramUpdate(env, update) {
   const quote = nrm(ALIAS[parts[3]] || parts[3]);
 
   try {
-    // price of 1 BASE in QUOTE
     const px = await getPriceBaseQuote(env, base, quote);
     const total = amt * px;
 
@@ -305,7 +320,14 @@ async function handleTelegramUpdate(env, update) {
 
     return await tgReply(env, msg.chat.id, body);
   } catch (e) {
-    console.log("conversion error:", String(e));
+    const msgTxt = ("" + e).toLowerCase();
+    // More helpful error text:
+    if (msgTxt.includes("symbol_missing")) {
+      return await tgReply(env, msg.chat.id, "That pair isn’t supported on primary markets. Try a different quote (e.g., USDT).");
+    }
+    if (msgTxt.includes("no price route")) {
+      return await tgReply(env, msg.chat.id, "Couldn’t find a price route right now. Try again or switch the quote to USDT.");
+    }
     return await tgReply(env, msg.chat.id, "Price service is busy. Try again.");
   }
 }
