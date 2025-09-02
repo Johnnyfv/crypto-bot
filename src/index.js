@@ -7,7 +7,6 @@ function nrm(s) { return String(s ?? "").toLowerCase().trim(); }
 function upper(s) { return String(s ?? "").toUpperCase().trim(); }
 
 // Small optional alias map (helps with odd tickers / synonyms).
-// Not required, but nice for common variations.
 const ALIAS = {
   xbt: "btc",
   wif: "wif",     // dogwifhat
@@ -53,7 +52,7 @@ function fmt(num, quote) {
   const x = Number(num);
   const q = nrm(quote);
   if (!isFinite(x)) return String(num);
-  // For stables / "fiat-like" (usdt/usdc) show 2-4 decimals depending on size
+  // For stables
   if (q === "usdt" || q === "usdc" || q === "dai") {
     if (x >= 1) return x.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     if (x >= 0.01) return x.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 });
@@ -67,11 +66,10 @@ function fmt(num, quote) {
 // ======================= Price Providers =======================
 // Binance (primary). Returns price of 1 BASE in QUOTE (e.g., BTC/USDT).
 async function binancePrice(base, quote) {
-  const symbol = (upper(base) + upper(quote)); // e.g., BTC + USDT => BTCUSDT
+  const symbol = (upper(base) + upper(quote));
   const url = `https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`;
   const r = await fetch(url, { headers: { "Accept": "application/json" } });
   if (!r.ok) {
-    // 400/404 means symbol pair doesn't exist on Binance
     const msg = `binance ${symbol} ${r.status}`;
     if (r.status === 400 || r.status === 404) {
       const err = new Error(msg);
@@ -121,7 +119,7 @@ async function getPriceBaseQuote(env, base, quote) {
   const c = cacheGet(key);
   if (c) return c;
 
-  // 1) Try Binance direct unless cooling
+  // 1) Binance direct unless cooling
   if (!inBinanceCooldown()) {
     try {
       const p = await binancePrice(base, quote);
@@ -129,15 +127,14 @@ async function getPriceBaseQuote(env, base, quote) {
       return p;
     } catch (e) {
       if (e && e.code === "SYMBOL_MISSING") {
-        // Try pivot via USDT if direct symbol missing
+        // try pivot next
       } else {
-        // transient Binance issue → brief cooldown
-        coolBinance(20_000);
+        coolBinance(20_000); // transient issue
       }
     }
   }
 
-  // 2) Try Binance pivot via USDT (BASE/USDT & QUOTE/USDT)
+  // 2) Binance pivot via USDT
   const pivot = "usdt";
   if (base !== pivot && quote !== pivot && !inBinanceCooldown()) {
     try {
@@ -230,25 +227,37 @@ async function handleTelegramUpdate(env, update) {
   if (msg.from && tooSoon(lastByUser, msg.from.id, 700)) return new Response("ok");
 
   // Parse command
-  const text = msg.text.trim().replace(/\u00A0/g, " ");
-  const lower = text.toLowerCase();
-  if (!lower.startsWith("/c")) return new Response("ok");
+  const raw = msg.text.trim().replace(/\u00A0/g, " ");
+  const parts = raw.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
 
-  const parts = text.split(/\s+/);
-  // allow /c or /c@YourBot
-  const mention = (parts[0].split("@")[1] || "").toLowerCase();
+  // accept /c or /c@YourBot
+  if (!cmd.startsWith("/c")) return new Response("ok");
+  const mention = (cmd.split("@")[1] || "").toLowerCase();
   if (mention && env.BOT_USERNAME && mention !== env.BOT_USERNAME.toLowerCase()) {
     return new Response("ok");
   }
-  if (parts.length < 4) return new Response("ok");
 
+  // Help if not enough args
+  if (parts.length < 4) {
+    return await tgReply(
+      env,
+      msg.chat.id,
+      "Usage:\n\n/c <amount> <base coin> <quote coin>\n\nExamples:\n/c 1 btc usdt\n/c 5 eth btc\n/c 10 sol usdc\n\nNotes:\n• No commas in the amount\n• Works in groups and DMs"
+    );
+  }
+
+  // No-commas rule + amount parse
   const amtStr = parts[1];
-  if (/,/.test(amtStr)) return new Response("ok"); // no commas rule
+  if (/,/.test(amtStr)) return new Response("ok");
   const amt = Number(amtStr);
-  if (!isFinite(amt)) return new Response("ok");
+  if (!isFinite(amt) || amt <= 0) {
+    return await tgReply(env, msg.chat.id, "Invalid amount.");
+  }
 
-  let base = nrm(ALIAS[parts[2]] || parts[2]);
-  let quote = nrm(ALIAS[parts[3]] || parts[3]);
+  // Symbols
+  const base = nrm(ALIAS[parts[2]] || parts[2]);
+  const quote = nrm(ALIAS[parts[3]] || parts[3]);
 
   try {
     // price of 1 BASE in QUOTE
@@ -262,8 +271,7 @@ async function handleTelegramUpdate(env, update) {
     return await tgReply(env, msg.chat.id, body);
   } catch (e) {
     console.log("conversion error:", String(e));
-    // Quietly stop rather than spamming errors in chats
-    return new Response("ok");
+    return await tgReply(env, msg.chat.id, "Price service is busy. Try again.");
   }
 }
 
@@ -275,7 +283,7 @@ export default {
     }
 
     if (request.method === "POST") {
-      // Optional: verify Telegram webhook secret if you set one
+      // Optional webhook secret check
       const given = request.headers.get("x-telegram-bot-api-secret-token");
       if (env.WEBHOOK_SECRET && given !== env.WEBHOOK_SECRET) {
         return new Response("Forbidden", { status: 403 });
