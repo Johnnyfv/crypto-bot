@@ -266,62 +266,28 @@ async function handleTelegramUpdate(env, update) {
     const baseId = await symbolToId(baseSym);
     if (!baseId) return await tgReply(env, msg.chat.id, `Unknown base: ${baseSym}`);
 
-    const base = nrm(baseSym);
-const quote = nrm(quoteSym);
+  const base = nrm(baseSym);
+    const quote = nrm(quoteSym);
 
-// ----- 1) crypto → fiat  (already worked before)
-if (!FIAT.has(base) && FIAT.has(quote)) {
-  const baseId = await symbolToId(env, baseSym);
-  if (!baseId) return await tgReply(env, msg.chat.id, `Unknown base: ${baseSym}`);
-  const prices = await geckoPriceCached(env, [baseId], [quote]);
-  const p = prices?.[baseId]?.[quote];
-  if (p == null) return await tgReply(env, msg.chat.id, "Price unavailable.");
-  const total = amt * Number(p);
-  const body = `${amt} ${base.toUpperCase()} ≈ ${fmt(total, quote)} ${quote.toUpperCase()}\n(1 ${base.toUpperCase()} = ${fmt(p, quote)} ${quote.toUpperCase()})`;
-  return await tgReply(env, msg.chat.id, body);
-}
-
-// ----- 2) crypto → crypto  (already worked before)
-if (!FIAT.has(base) && !FIAT.has(quote)) {
-  const baseId  = await symbolToId(env, baseSym);
-  const quoteId = await symbolToId(env, quoteSym);
-  if (!baseId)  return await tgReply(env, msg.chat.id, `Unknown base: ${baseSym}`);
-  if (!quoteId) return await tgReply(env, msg.chat.id, `Unknown quote: ${quoteSym}`);
-  const prices = await geckoPriceCached(env, [baseId, quoteId], ["usd"]);
-  const pBase = prices?.[baseId]?.usd;
-  const pQuote = prices?.[quoteId]?.usd;
-  if (!pBase || !pQuote) return await tgReply(env, msg.chat.id, "Price unavailable.");
-  const rate = Number(pBase) / Number(pQuote);
-  const total = amt * rate;
-  const body = `${amt} ${base.toUpperCase()} ≈ ${fmt(total, quote)} ${quote.toUpperCase()}\n(1 ${base.toUpperCase()} = ${fmt(rate, quote)} ${quote.toUpperCase()})`;
-  return await tgReply(env, msg.chat.id, body);
-}
-
-// ----- 3) fiat → crypto  ✅ new
-if (FIAT.has(base) && !FIAT.has(quote)) {
-  const quoteId = await symbolToId(env, quoteSym);
-  if (!quoteId) return await tgReply(env, msg.chat.id, `Unknown quote: ${quoteSym}`);
-  // price of 1 QUOTE in BASE fiat (e.g., 1 USDC in ARS)
-  const prices = await geckoPriceCached(env, [quoteId], [base]);
-  const p = prices?.[quoteId]?.[base];
-  if (p == null || p <= 0) return await tgReply(env, msg.chat.id, "Price unavailable.");
-  const units = amt / Number(p); // how many QUOTE you get for <amt> BASE-fiat
-  const body = `${amt} ${base.toUpperCase()} ≈ ${fmt(units, quote)} ${quote.toUpperCase()}\n(1 ${quote.toUpperCase()} = ${fmt(p, base)} ${base.toUpperCase()})`;
-  return await tgReply(env, msg.chat.id, body);
-}
-
-// ----- 4) fiat → fiat  ✅ new (pivot via USDT so we stay on CoinGecko)
-if (FIAT.has(base) && FIAT.has(quote)) {
-  // price of 1 USDT in each fiat; rate = quote/base
-  const prices = await geckoPriceCached(env, ["tether"], [base, quote]);
-  const pBase  = prices?.tether?.[base];   // e.g., 1 USDT = X ARS
-  const pQuote = prices?.tether?.[quote];  // e.g., 1 USDT = Y USD
-  if (!pBase || !pQuote) return await tgReply(env, msg.chat.id, "Rate unavailable.");
-  const rate  = Number(pQuote) / Number(pBase); // 1 BASE = rate QUOTE
-  const total = amt * rate;
-  const body = `${amt} ${base.toUpperCase()} ≈ ${fmt(total, quote)} ${quote.toUpperCase()}\n(1 ${base.toUpperCase()} = ${fmt(rate, quote)} ${quote.toUpperCase()})`;
-  return await tgReply(env, msg.chat.id, body);
-}
+    if (FIAT.has(quote)) {
+      const prices = await geckoPrice([baseId], [quote]);
+      const p = prices?.[baseId]?.[quote];
+      if (p == null) return await tgReply(env, msg.chat.id, "Price unavailable.");
+      const total = amt * Number(p);
+      const body = `${amt} ${base.toUpperCase()} ≈ ${fmt(total, quote)} ${quote.toUpperCase()}\n(1 ${base.toUpperCase()} = ${fmt(p, quote)} ${quote.toUpperCase()})`;
+      return await tgReply(env, msg.chat.id, body);
+    } else {
+      const quoteId = await symbolToId(quoteSym);
+      if (!quoteId) return await tgReply(env, msg.chat.id, `Unknown quote: ${quoteSym}`);
+      const prices = await geckoPrice([baseId, quoteId], ["usd"]);
+      const pBase = prices?.[baseId]?.usd;
+      const pQuote = prices?.[quoteId]?.usd;
+      if (!pBase || !pQuote) return await tgReply(env, msg.chat.id, "Price unavailable.");
+      const rate = Number(pBase) / Number(pQuote);
+      const total = amt * rate;
+      const body = `${amt} ${base.toUpperCase()} ≈ ${fmt(total, quote)} ${quote.toUpperCase()}\n(1 ${base.toUpperCase()} = ${fmt(rate, quote)} ${quote.toUpperCase()})`;
+      return await tgReply(env, msg.chat.id, body);
+    }
   } catch (e) {
     console.log("conversion error:", e);
     return await tgReply(env, msg.chat.id, "Price service is busy. Try again.");
