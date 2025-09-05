@@ -1,4 +1,4 @@
-// Telegram crypto converter — Cloudflare Worker
+// Telegram crypto converter — Cloudflare Worker (clean structured logs)
 // Commands:
 //   /c <amount> <base> <quote>
 //   /cbot            (help card)
@@ -7,6 +7,7 @@
 const nrm = (s) => String(s ?? "").trim().toLowerCase();
 const U = (s) => String(s ?? "").trim().toUpperCase();
 const now = () => Date.now();
+const slog = (o) => { try { console.log(JSON.stringify(o)); } catch {} };
 
 // alias niceties (add if you like)
 const ALIAS = { xbt: "btc" };
@@ -222,13 +223,31 @@ async function handleUpdate(env, upd) {
   const msg = upd.message || upd.edited_message;
   if (!msg || typeof msg.text !== "string") return new Response("ok");
 
+  // Build a compact context for all logs
+  const baseLog = {
+    user: {
+      id: msg.from?.id,
+      username: msg.from?.username || null,
+      name: [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || null
+    },
+    chat: {
+      id: msg.chat?.id,
+      type: msg.chat?.type,
+      title: msg.chat?.title || null
+    },
+    msg: {
+      id: msg.message_id,
+      date: msg.date,
+      text: msg.text
+    }
+  };
+
   const text = msg.text.replace(/\u00A0/g, " ").trim();
   const lower = text.toLowerCase();
 
-  // if group privacy is ON, we’ll only see commands or @mentions — this is good.
-
   // /cbot → help
   if (lower === "/cbot" || lower.startsWith("/cbot@")) {
+    slog({ ...baseLog, event: "help" });
     return tgSend(env, msg.chat.id, helpCard());
   }
 
@@ -238,17 +257,31 @@ async function handleUpdate(env, upd) {
     const first = text.split(/\s+/)[0];
     const mention = (first.split("@")[1] || "").toLowerCase();
     if (mention && env.BOT_USERNAME && mention !== env.BOT_USERNAME.toLowerCase()) {
+      // not for us
+      slog({ ...baseLog, event: "ignored_not_our_mention" });
       return new Response("ok");
     }
 
     const parts = text.split(/\s+/);
-    if (parts.length < 2) { return tgSend(env, msg.chat.id, helpCard()); }
-    if (parts.length < 4) { return tgSend(env, msg.chat.id, "Format: /c <amount> <base> <quote> (e.g., /c 2 btc usdt)"); }
+    if (parts.length < 2) {
+      slog({ ...baseLog, event: "usage_prompt" });
+      return tgSend(env, msg.chat.id, helpCard());
+    }
+    if (parts.length < 4) {
+      slog({ ...baseLog, event: "bad_arity", got: parts.length });
+      return tgSend(env, msg.chat.id, "Format: /c <amount> <base> <quote> (e.g., /c 2 btc usdt)");
+    }
 
     const amtStr = parts[1];
-    if (/,/.test(amtStr)) return tgSend(env, msg.chat.id, "No commas in the amount, please.");
+    if (/,/.test(amtStr)) {
+      slog({ ...baseLog, event: "reject_commas" });
+      return tgSend(env, msg.chat.id, "No commas in the amount, please.");
+    }
     const amt = Number(amtStr);
-    if (!isFinite(amt) || amt <= 0) return tgSend(env, msg.chat.id, "Invalid amount.");
+    if (!isFinite(amt) || amt <= 0) {
+      slog({ ...baseLog, event: "invalid_amount", amtStr });
+      return tgSend(env, msg.chat.id, "Invalid amount.");
+    }
 
     const base = nrm(ALIAS[parts[2]] || parts[2]);
     const quote = nrm(ALIAS[parts[3]] || parts[3]);
@@ -259,21 +292,23 @@ async function handleUpdate(env, upd) {
       const body =
         `${fmt(amt, base)} ${U(base)} ≈ ${fmt(total, quote)} ${U(quote)}\n` +
         `(1 ${U(base)} = ${fmt(px, quote)} ${U(quote)})`;
+
+      slog({ ...baseLog, event: "convert_ok", amt, base, quote, rate: px });
       return tgSend(env, msg.chat.id, body);
     } catch (e) {
-      const err = String(e && e.message || e);
-      if (err.includes("BAD_SYMBOL")) {
-        return tgSend(env, msg.chat.id, "Unknown symbol. Try common tickers (btc, eth, usdt, sol, etc.).");
-      }
-      if (err.includes("NO_ROUTE")) {
-        return tgSend(env, msg.chat.id, "No price available for that pair right now. Try again, reverse the pair, or use USDT/USDC as the quote.");
-      }
-      // transient provider trouble
-      return tgSend(env, msg.chat.id, "Price providers are busy. Please try again in a moment.");
+      const msgErr = String(e && e.message || e);
+      let userMsg = "Price providers are busy. Please try again in a moment.";
+      let errCode = "PROVIDER_BUSY";
+      if (msgErr.includes("BAD_SYMBOL")) { userMsg = "Unknown symbol. Try common tickers (btc, eth, usdt, sol, etc.)."; errCode = "BAD_SYMBOL"; }
+      else if (msgErr.includes("NO_ROUTE")) { userMsg = "No price available for that pair right now. Try again, reverse the pair, or use USDT/USDC as the quote."; errCode = "NO_ROUTE"; }
+
+      slog({ ...baseLog, event: "convert_error", amt, base, quote, error: errCode });
+      return tgSend(env, msg.chat.id, userMsg);
     }
   }
 
   // ignore anything else (saves your monthly API quota)
+  slog({ ...baseLog, event: "ignored_non_command" });
   return new Response("ok");
 }
 
