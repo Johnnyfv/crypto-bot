@@ -1,174 +1,294 @@
-// Telegram Converter Bot — Cloudflare Worker
-// Commands: /c and /cbot
-// Usage: /c <amount> <base> <quote>
-// Example: /c 2 btc usdt
+// Telegram crypto converter — Cloudflare Worker
+// Commands:
+//   /c <amount> <base> <quote>
+//   /cbot            (help card)
 
-// ============= Utils =============
-function nrm(s){ return String(s ?? "").toLowerCase().trim(); }
-function upper(s){ return String(s ?? "").toUpperCase().trim(); }
+// -------------------- tiny utils --------------------
+const nrm = (s) => String(s ?? "").trim().toLowerCase();
+const U = (s) => String(s ?? "").trim().toUpperCase();
+const now = () => Date.now();
 
-// A few handy aliases (not required, but helps users)
-const ALIAS = { xbt:"btc", usdt:"usdt", usdc:"usdc", dai:"dai", eth:"eth", btc:"btc", sol:"sol", doge:"doge", shib:"shib" };
+// alias niceties (add if you like)
+const ALIAS = { xbt: "btc" };
 
-function fmt(num, quote){
-  const x = Number(num), q = nrm(quote);
-  if (!isFinite(x)) return String(num);
+function fmt(n, quote) {
+  const x = Number(n);
+  const q = nrm(quote);
+  if (!isFinite(x)) return String(n);
   if (q === "usdt" || q === "usdc" || q === "dai") {
-    if (x >= 1) return x.toFixed(2);
-    if (x >= 0.01) return x.toFixed(4);
+    if (x >= 1) return x.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (x >= 0.01) return x.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 });
     return x.toFixed(6);
   }
   if (x >= 1) return x.toFixed(6).replace(/\.?0+$/,"");
   return x.toFixed(10).replace(/\.?0+$/,"");
 }
 
-// ============= Prices (Binance) =============
-async function binancePrice(base, quote){
-  const symbol = upper(base) + upper(quote);
-  const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`, { headers:{Accept:"application/json"} });
-  if (!r.ok) throw new Error("binance " + r.status);
+// -------------------- simple caches/cooldowns --------------------
+const PRICE_CACHE = new Map(); // key -> {t,v}
+const TTL = 30_000;
+const cd = { binance: 0, kucoin: 0 };
+const cool = (k, ms) => { cd[k] = Math.max(cd[k], now() + ms); };
+const inCd  = (k) => now() < (cd[k] || 0);
+
+const cget = (k) => {
+  const e = PRICE_CACHE.get(k);
+  return e && (now() - e.t) < TTL ? e.v : null;
+};
+const cput = (k, v) => PRICE_CACHE.set(k, { t: now(), v });
+
+// -------------------- providers (1 base in quote) --------------------
+// Binance spot: BTCUSDT, ETHBTC, etc.
+async function binance(base, quote) {
+  const symbol = U(base) + U(quote);
+  const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`, {
+    headers: { Accept: "application/json" }
+  });
+  if (!r.ok) {
+    if (r.status === 400 || r.status === 404) {
+      const e = new Error("BINANCE_SYMBOL_MISSING"); e.code = "MISSING"; throw e;
+    }
+    throw new Error(`BINANCE_${r.status}`);
+  }
   const j = await r.json();
   const p = Number(j.price);
-  if (!isFinite(p) || p <= 0) throw new Error("bad price");
+  if (!isFinite(p) || p <= 0) throw new Error("BINANCE_BAD_PRICE");
   return p;
 }
 
-// Small cache (30s)
-const CACHE = new Map();
-function cacheGet(key, ttl=30_000){ const e=CACHE.get(key); return e && Date.now()-e.t < ttl ? e.v : null; }
-function cachePut(key,v){ CACHE.set(key,{t:Date.now(),v}); }
+// KuCoin spot: BTC-USDT, ETH-BTC, …
+async function kucoin(base, quote) {
+  const symbol = `${U(base)}-${U(quote)}`;
+  const r = await fetch(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${symbol}`, {
+    headers: { Accept: "application/json" }
+  });
+  if (!r.ok) {
+    if (r.status === 400 || r.status === 404) { const e = new Error("KUCOIN_SYMBOL_MISSING"); e.code="MISSING"; throw e; }
+    throw new Error(`KUCOIN_${r.status}`);
+  }
+  const j = await r.json();
+  if (j.code !== "200000") throw new Error("KUCOIN_BAD");
+  const p = Number(j.data?.price);
+  if (!isFinite(p) || p <= 0) throw new Error("KUCOIN_BAD_PRICE");
+  return p;
+}
 
-async function getPrice(base, quote){
-  base = nrm(ALIAS[base] || base);
-  quote = nrm(ALIAS[quote] || quote);
+// CryptoCompare (key optional). fsym=BTC&tsyms=ETH,USDT,…
+async function cc(env, base, quote) {
+  const url = `https://min-api.cryptocompare.com/data/price?fsym=${U(base)}&tsyms=${U(quote)}`;
+  const headers = { Accept: "application/json" };
+  if (env.CRYPTOCOMPARE_KEY) headers.authorization = `Apikey ${env.CRYPTOCOMPARE_KEY}`;
+  const r = await fetch(url, { headers });
+  if (!r.ok) throw new Error(`CC_${r.status}`);
+  const j = await r.json();
+  const p = Number(j[U(quote)]);
+  if (!isFinite(p) || p <= 0) throw new Error("CC_BAD");
+  return p;
+}
+
+// Coinbase: /v2/exchange-rates?currency=BASE → map of quotes
+async function coinbase(base, quote) {
+  const r = await fetch(`https://api.coinbase.com/v2/exchange-rates?currency=${U(base)}`, {
+    headers: { Accept: "application/json" }
+  });
+  if (!r.ok) throw new Error(`COINBASE_${r.status}`);
+  const j = await r.json();
+  const p = Number(j?.data?.rates?.[U(quote)]);
+  if (!isFinite(p) || p <= 0) throw new Error("COINBASE_BAD");
+  return p;
+}
+
+// core resolver
+async function priceBaseInQuote(env, baseIn, quoteIn) {
+  let base = nrm(ALIAS[baseIn] || baseIn);
+  let quote = nrm(ALIAS[quoteIn] || quoteIn);
+
+  if (!base || !quote) throw new Error("BAD_SYMBOL");
   if (base === quote) return 1;
 
-  const key = `${base}:${quote}`;
-  const c = cacheGet(key); if (c) return c;
+  const key = `px:${base}:${quote}`;
+  const cached = cget(key);
+  if (cached) return cached;
 
-  // Direct
-  try { const p = await binancePrice(base, quote); cachePut(key,p); return p; } catch {}
+  const pivot = "usdt";
 
-  // Pivot via USDT
+  // 1) Binance direct (if not cooling)
+  if (!inCd("binance")) {
+    try { const p = await binance(base, quote); cput(key, p); return p; }
+    catch (e) { if (!e?.code) cool("binance", 20_000); }
+  }
+
+  // 2) Binance pivot via USDT
+  if (!inCd("binance") && base !== pivot && quote !== pivot) {
+    try {
+      const pB = await binance(base, pivot);
+      const pQ = await binance(quote, pivot);
+      const p = pB / pQ;
+      if (isFinite(p) && p > 0) { cput(key, p); return p; }
+    } catch (e) { if (!e?.code) cool("binance", 20_000); }
+  }
+
+  // 3) KuCoin direct
+  if (!inCd("kucoin")) {
+    try { const p = await kucoin(base, quote); cput(key, p); return p; }
+    catch (e) { if (!e?.code) cool("kucoin", 20_000); }
+  }
+
+  // 4) KuCoin pivot
+  if (!inCd("kucoin") && base !== pivot && quote !== pivot) {
+    try {
+      const pB = await kucoin(base, pivot);
+      const pQ = await kucoin(quote, pivot);
+      const p = pB / pQ;
+      if (isFinite(p) && p > 0) { cput(key, p); return p; }
+    } catch (e) { if (!e?.code) cool("kucoin", 20_000); }
+  }
+
+  // 5) CryptoCompare direct
+  try { const p = await cc(env, base, quote); cput(key, p); return p; } catch {}
+
+  // 6) CryptoCompare pivot
   try {
-    const pb = await binancePrice(base, "usdt");
-    const pq = await binancePrice(quote, "usdt");
-    const rate = pb / pq;
-    if (isFinite(rate) && rate > 0) { cachePut(key, rate); return rate; }
+    const pB = await cc(env, base, pivot);
+    const pQ = await cc(env, quote, pivot);
+    const p = pB / pQ;
+    if (isFinite(p) && p > 0) { cput(key, p); return p; }
   } catch {}
 
-  throw new Error("no price route");
+  // 7) Coinbase direct
+  try { const p = await coinbase(base, quote); cput(key, p); return p; } catch {}
+
+  // 8) Coinbase invert (quote→base then invert)
+  try { const inv = await coinbase(quote, base); const p = 1 / inv; if (isFinite(p) && p > 0) { cput(key, p); return p; } } catch {}
+
+  throw new Error("NO_ROUTE");
 }
 
-// ============= Telegram I/O =============
-async function tgSend(env, chatId, text){
-  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
+// -------------------- Telegram I/O --------------------
+const cooldownByChat = new Map();
+const lastMsgHash = new Map();
+const inCooldown = (id) => now() < (cooldownByChat.get(id) || 0);
+
+async function tgSend(env, chatId, text) {
+  if (inCooldown(chatId)) return new Response("ok");
+
+  // dedupe identical reply bursts per chat
+  const h = `${text.length}:${text.slice(0,64)}`;
+  const prev = lastMsgHash.get(chatId);
+  const t = now();
+  if (prev && prev.h === h && t < prev.until) return new Response("ok");
+  lastMsgHash.set(chatId, { h, until: t + 5000 });
+
+  const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text })
-  }).catch(()=>{});
-}
+  });
 
-function parseCommand(text){
-  // Accept /c or /cbot, with optional @BotUsername
-  // Returns { cmd, mention, parts } or null
-  const parts = text.trim().replace(/\u00A0/g," ").split(/\s+/);
-  if (parts.length === 0) return null;
-  const rawCmd = parts[0];             // e.g. "/c@CConvertibot"
-  if (!rawCmd.startsWith("/")) return null;
-
-  const [cmdOnly, mention] = rawCmd.split("@"); // ["/c", "CConvertibot"]
-  const cmdLower = cmdOnly.toLowerCase();
-
-  const ok = cmdLower === "/c" || cmdLower === "/cbot";
-  if (!ok) return null;
-
-  return { cmd: cmdLower, mention: (mention || ""), parts };
-}
-
-async function handleUpdate(env, update){
-  // Only care about text messages (privacy mode + not admin reduces noise, this is extra safety)
-  const msg = update.message || update.edited_message;
-  if (!msg || typeof msg.text !== "string") return new Response("ok");
-
-  const cmdInfo = parseCommand(msg.text);
-  if (!cmdInfo) return new Response("ok"); // not our command
-
-  // If command has @mention, ensure it's for THIS bot (when BOT_USERNAME is set)
-  if (cmdInfo.mention && env.BOT_USERNAME && cmdInfo.mention.toLowerCase() !== env.BOT_USERNAME.toLowerCase()) {
-    return new Response("ok");
+  if (!r.ok) {
+    const raw = await r.text().catch(() => "");
+    let retrySec = 2;
+    try { const j = JSON.parse(raw); if (j?.parameters?.retry_after) retrySec = Math.max(1, +j.parameters.retry_after); } catch {}
+    const m = /retry after (\d+)/i.exec(raw); if (m) retrySec = Math.max(retrySec, parseInt(m[1],10));
+    if (r.status === 429) { cooldownByChat.set(chatId, now() + retrySec * 1000); return new Response("ok"); }
   }
-
-  // Help screen when only the command is typed (no args)
-  if (cmdInfo.parts.length < 4) {
-    await tgSend(env, msg.chat.id,
-`Crypto Convert Bot
-
-Usage:
-/c <amount> <base> <quote>
-/cbot <amount> <base> <quote>
-
-Examples:
-/c 1 btc usdt
-/cbot 5 eth btc
-/c 10 sol usdc
-
-Notes:
-• No commas in the amount
-• Works in groups and DMs
-
-Support ❤️ https://cwallet.com/t/1PYNYSIY`);
-    return new Response("ok");
-  }
-
-  const [, amtStr, base, quote] = cmdInfo.parts;
-
-  // No commas rule for amount
-  if (/,/.test(amtStr)) {
-    await tgSend(env, msg.chat.id, "Invalid amount (no commas). Try: 1.5 not 1,5");
-    return new Response("ok");
-  }
-
-  const amt = Number(amtStr);
-  if (!isFinite(amt) || amt <= 0) {
-    await tgSend(env, msg.chat.id, "Invalid amount.");
-    return new Response("ok");
-  }
-
-  try {
-    const px = await getPrice(base, quote);
-    const total = amt * px;
-    const reply =
-      `${amt} ${upper(base)} ≈ ${fmt(total, quote)} ${upper(quote)}\n` +
-      `(1 ${upper(base)} = ${fmt(px, quote)} ${upper(quote)})`;
-    await tgSend(env, msg.chat.id, reply);
-  } catch (e) {
-    // Friendlier errors for common cases
-    const b = nrm(base), q = nrm(quote);
-    if ((b === "usdt" || b === "usdc" || b === "dai") && (q === "usdt" || q === "usdc" || q === "dai")) {
-      await tgSend(env, msg.chat.id, "No route for that stable/stable pair on Binance. Try a different quote.");
-    } else {
-      await tgSend(env, msg.chat.id, "No price available for that pair right now. Try again or reverse the pair.");
-    }
-  }
-
   return new Response("ok");
 }
 
-// ============= Worker Entry =============
+function helpCard() {
+  return [
+    "Crypto Convert Bot",
+    "",
+    "Usage:",
+    "/c <amount> <base> <quote>",
+    "",
+    "Examples:",
+    "/c 1 btc usdt",
+    "/c 5 eth btc",
+    "/c 10 sol usdc",
+    "",
+    "Notes:",
+    "• No commas in the amount",
+    "• Works in groups and DMs",
+    "",
+    "Support the bot:",
+    "https://cwallet.com/t/1PYNYSIY"
+  ].join("\n");
+}
+
+// -------------------- update handler --------------------
+async function handleUpdate(env, upd) {
+  // accept only message / edited_message (you set this in webhook)
+  const msg = upd.message || upd.edited_message;
+  if (!msg || typeof msg.text !== "string") return new Response("ok");
+
+  const text = msg.text.replace(/\u00A0/g, " ").trim();
+  const lower = text.toLowerCase();
+
+  // if group privacy is ON, we’ll only see commands or @mentions — this is good.
+
+  // /cbot → help
+  if (lower === "/cbot" || lower.startsWith("/cbot@")) {
+    return tgSend(env, msg.chat.id, helpCard());
+  }
+
+  // /c …  (and /c@YourBot …)
+  if (lower.startsWith("/c")) {
+    // only allow /c or /c@<bot>
+    const first = text.split(/\s+/)[0];
+    const mention = (first.split("@")[1] || "").toLowerCase();
+    if (mention && env.BOT_USERNAME && mention !== env.BOT_USERNAME.toLowerCase()) {
+      return new Response("ok");
+    }
+
+    const parts = text.split(/\s+/);
+    if (parts.length < 2) { return tgSend(env, msg.chat.id, helpCard()); }
+    if (parts.length < 4) { return tgSend(env, msg.chat.id, "Format: /c <amount> <base> <quote> (e.g., /c 2 btc usdt)"); }
+
+    const amtStr = parts[1];
+    if (/,/.test(amtStr)) return tgSend(env, msg.chat.id, "No commas in the amount, please.");
+    const amt = Number(amtStr);
+    if (!isFinite(amt) || amt <= 0) return tgSend(env, msg.chat.id, "Invalid amount.");
+
+    const base = nrm(ALIAS[parts[2]] || parts[2]);
+    const quote = nrm(ALIAS[parts[3]] || parts[3]);
+
+    try {
+      const px = await priceBaseInQuote(env, base, quote);  // 1 base in quote
+      const total = amt * px;
+      const body =
+        `${fmt(amt, base)} ${U(base)} ≈ ${fmt(total, quote)} ${U(quote)}\n` +
+        `(1 ${U(base)} = ${fmt(px, quote)} ${U(quote)})`;
+      return tgSend(env, msg.chat.id, body);
+    } catch (e) {
+      const err = String(e && e.message || e);
+      if (err.includes("BAD_SYMBOL")) {
+        return tgSend(env, msg.chat.id, "Unknown symbol. Try common tickers (btc, eth, usdt, sol, etc.).");
+      }
+      if (err.includes("NO_ROUTE")) {
+        return tgSend(env, msg.chat.id, "No price available for that pair right now. Try again, reverse the pair, or use USDT/USDC as the quote.");
+      }
+      // transient provider trouble
+      return tgSend(env, msg.chat.id, "Price providers are busy. Please try again in a moment.");
+    }
+  }
+
+  // ignore anything else (saves your monthly API quota)
+  return new Response("ok");
+}
+
+// -------------------- worker entry --------------------
 export default {
   async fetch(request, env) {
-    // Enforce Telegram secret (blocks non-Telegram traffic)
     if (request.method === "POST") {
+      // webhook secret check (optional but recommended)
       const given = request.headers.get("x-telegram-bot-api-secret-token");
       if (env.WEBHOOK_SECRET && given !== env.WEBHOOK_SECRET) {
         return new Response("Forbidden", { status: 403 });
       }
       const update = await request.json().catch(() => ({}));
-      return await handleUpdate(env, update);
+      return handleUpdate(env, update);
     }
-
-    return new Response("Converter bot is running.");
+    return new Response("OK");
   }
 };
