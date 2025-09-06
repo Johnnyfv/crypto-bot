@@ -1,7 +1,8 @@
 // Telegram crypto converter — Cloudflare Worker (clean structured logs)
 // Commands:
 //   /c <amount> <base> <quote>
-//   /cbot            (help card)
+//   /cv <amount> <base> <quote>   (alias of /c)
+//   /cbot                         (help card)
 
 // -------------------- tiny utils --------------------
 const nrm = (s) => String(s ?? "").trim().toLowerCase();
@@ -202,10 +203,11 @@ function helpCard() {
     "",
     "Usage:",
     "/c <amount> <base> <quote>",
+    "/cv <amount> <base> <quote>",
     "",
     "Examples:",
     "/c 1 btc usdt",
-    "/c 5 eth btc",
+    "/cv 5 eth btc",
     "/c 10 sol usdc",
     "",
     "Notes:",
@@ -223,46 +225,33 @@ async function handleUpdate(env, upd) {
   const msg = upd.message || upd.edited_message;
   if (!msg || typeof msg.text !== "string") return new Response("ok");
 
-  // Build a compact context for all logs
+  // compact context for logs
   const baseLog = {
-    user: {
-      id: msg.from?.id,
-      username: msg.from?.username || null,
-      name: [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || null
-    },
-    chat: {
-      id: msg.chat?.id,
-      type: msg.chat?.type,
-      title: msg.chat?.title || null
-    },
-    msg: {
-      id: msg.message_id,
-      date: msg.date,
-      text: msg.text
-    }
+    user: { id: msg.from?.id, username: msg.from?.username || null,
+            name: [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || null },
+    chat: { id: msg.chat?.id, type: msg.chat?.type, title: msg.chat?.title || null },
+    msg:  { id: msg.message_id, date: msg.date, text: msg.text }
   };
 
   const text = msg.text.replace(/\u00A0/g, " ").trim();
-  const lower = text.toLowerCase();
+  const parts = text.split(/\s+/);
+  const firstLower = (parts[0] || "").toLowerCase();
+
+  // parse "/cmd" and optional "@bot"
+  const [cmd, at] = firstLower.split("@");
+  if (at && env.BOT_USERNAME && at !== env.BOT_USERNAME.toLowerCase()) {
+    slog({ ...baseLog, event: "ignored_not_our_mention" });
+    return new Response("ok");
+  }
 
   // /cbot → help
-  if (lower === "/cbot" || lower.startsWith("/cbot@")) {
+  if (cmd === "/cbot") {
     slog({ ...baseLog, event: "help" });
     return tgSend(env, msg.chat.id, helpCard());
   }
 
-  // /c …  (and /c@YourBot …)
-  if (lower.startsWith("/c")) {
-    // only allow /c or /c@<bot>
-    const first = text.split(/\s+/)[0];
-    const mention = (first.split("@")[1] || "").toLowerCase();
-    if (mention && env.BOT_USERNAME && mention !== env.BOT_USERNAME.toLowerCase()) {
-      // not for us
-      slog({ ...baseLog, event: "ignored_not_our_mention" });
-      return new Response("ok");
-    }
-
-    const parts = text.split(/\s+/);
+  // /c or /cv → convert
+  if (cmd === "/c" || cmd === "/cv") {
     if (parts.length < 2) {
       slog({ ...baseLog, event: "usage_prompt" });
       return tgSend(env, msg.chat.id, helpCard());
@@ -293,7 +282,7 @@ async function handleUpdate(env, upd) {
         `${fmt(amt, base)} ${U(base)} ≈ ${fmt(total, quote)} ${U(quote)}\n` +
         `(1 ${U(base)} = ${fmt(px, quote)} ${U(quote)})`;
 
-      slog({ ...baseLog, event: "convert_ok", amt, base, quote, rate: px });
+      slog({ ...baseLog, event: "convert_ok", cmd, amt, base, quote, rate: px });
       return tgSend(env, msg.chat.id, body);
     } catch (e) {
       const msgErr = String(e && e.message || e);
@@ -302,7 +291,7 @@ async function handleUpdate(env, upd) {
       if (msgErr.includes("BAD_SYMBOL")) { userMsg = "Unknown symbol. Try common tickers (btc, eth, usdt, sol, etc.)."; errCode = "BAD_SYMBOL"; }
       else if (msgErr.includes("NO_ROUTE")) { userMsg = "No price available for that pair right now. Try again, reverse the pair, or use USDT/USDC as the quote."; errCode = "NO_ROUTE"; }
 
-      slog({ ...baseLog, event: "convert_error", amt, base, quote, error: errCode });
+      slog({ ...baseLog, event: "convert_error", cmd, amt, base, quote, error: errCode });
       return tgSend(env, msg.chat.id, userMsg);
     }
   }
