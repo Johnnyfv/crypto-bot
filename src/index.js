@@ -1,7 +1,8 @@
-// Telegram crypto converter — Cloudflare Worker (with /cv alias + strong send logs)
+// Telegram crypto converter — Cloudflare Worker (with /q alias)
 // Commands:
 //   /c   <amount> <base> <quote>
 //   /cv  <amount> <base> <quote>   (alias of /c)
+//   /q   <amount> <base> <quote>   (alias of /c)
 //   /cbot                          (help card)
 
 const nrm = s => String(s ?? "").trim().toLowerCase();
@@ -32,7 +33,7 @@ const cool = (k, ms) => { cd[k] = Math.max(cd[k], now() + ms); };
 const cget = k => { const e = PRICE_CACHE.get(k); return e && (now() - e.t) < TTL ? e.v : null; };
 const cput = (k, v) => PRICE_CACHE.set(k, { t: now(), v });
 
-// ---------- price providers (1 BASE in QUOTE) ----------
+// ---------- price providers ----------
 async function binance(base, quote) {
   const symbol = U(base) + U(quote);
   const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`, { headers: { Accept: "application/json" } });
@@ -50,7 +51,7 @@ async function kucoin(base, quote) {
   const symbol = `${U(base)}-${U(quote)}`;
   const r = await fetch(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${symbol}`, { headers: { Accept: "application/json" } });
   if (!r.ok) {
-    if (r.status === 400 || r.status === 404) { const e = new Error("KUCOIN_SYMBOL_MISSING"); e.code = "MISSING"; throw e; }
+    if (r.status === 400 || r.status === 404) { const e = new Error("KUCOIN_SYMBOL_MISSING"); e.code="MISSING"; throw e; }
     throw new Error(`KUCOIN_${r.status}`);
   }
   const j = await r.json();
@@ -153,19 +154,6 @@ async function tgSend(env, chatId, text) {
   const body = { chat_id: chatId, text };
 
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const raw = await r.text().catch(() => "");
-  let ok = false, desc = "", code = r.status;
-
-  try { const j = JSON.parse(raw); ok = !!j.ok; desc = j?.description || ""; } catch { desc = raw.slice(0, 120); }
-
-  if (!r.ok) {
-    let retrySec = 2;
-    try { const j = JSON.parse(raw); if (j?.parameters?.retry_after) retrySec = Math.max(1, +j.parameters.retry_after); } catch {}
-    const m = /retry after (\d+)/i.exec(raw); if (m) retrySec = Math.max(retrySec, parseInt(m[1],10));
-    if (r.status === 429) cooldownByChat.set(chatId, now() + retrySec * 1000);
-  }
-
-  slog({ event: "sendMessage_result", chatId, http: code, ok, desc: desc.slice(0, 80) });
   return new Response("ok");
 }
 
@@ -176,11 +164,12 @@ function helpCard() {
     "Usage:",
     "/c  <amount> <base> <quote>",
     "/cv <amount> <base> <quote>",
+    "/q  <amount> <base> <quote>",
     "",
     "Examples:",
     "/c 1 btc usdt",
     "/cv 5 eth btc",
-    "/c 10 sol usdc",
+    "/q 10 sol usdc",
     "",
     "Notes:",
     "• No commas in the amount",
@@ -205,7 +194,7 @@ async function handleUpdate(env, upd) {
   const text  = msg.text.replace(/\u00A0/g, " ").trim();
   const parts = text.split(/\s+/);
   const head  = (parts[0] || "").toLowerCase();
-  const [cmd, mention] = head.split("@"); // "/c", "/cv", "/cbot" + optional "@bot"
+  const [cmd, mention] = head.split("@");
 
   if (mention && env.BOT_USERNAME && mention !== env.BOT_USERNAME.toLowerCase()) {
     slog({ ...baseLog, event: "ignored_not_our_mention" });
@@ -217,7 +206,7 @@ async function handleUpdate(env, upd) {
     return tgSend(env, msg.chat.id, helpCard());
   }
 
-  if (cmd === "/c" || cmd === "/cv") {
+  if (cmd === "/c" || cmd === "/cv" || cmd === "/q") {
     if (parts.length < 2) {
       slog({ ...baseLog, event: "usage_prompt" });
       return tgSend(env, msg.chat.id, helpCard());
@@ -254,7 +243,6 @@ async function handleUpdate(env, upd) {
     }
   }
 
-  // ignore everything else to save quota
   slog({ ...baseLog, event: "ignored_non_command" });
   return new Response("ok");
 }
