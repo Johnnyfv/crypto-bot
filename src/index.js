@@ -1,4 +1,4 @@
-// Telegram crypto converter — Cloudflare Worker (with /q alias)
+// Telegram crypto converter — Cloudflare Worker (privacy-safe logs)
 // Commands:
 //   /c   <amount> <base> <quote>
 //   /cv  <amount> <base> <quote>   (alias of /c)
@@ -153,7 +153,7 @@ async function tgSend(env, chatId, text) {
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   const body = { chat_id: chatId, text };
 
-  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(()=>{});
   return new Response("ok");
 }
 
@@ -185,21 +185,22 @@ async function handleUpdate(env, upd) {
   const msg = upd.message || upd.edited_message;
   if (!msg || typeof msg.text !== "string") return new Response("ok");
 
-  const baseLog = {
-    user: { id: msg.from?.id, username: msg.from?.username || null, name: [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || null },
-    chat: { id: msg.chat?.id, type: msg.chat?.type, title: msg.chat?.title || null },
-    msg:  { id: msg.message_id, date: msg.date, text: msg.text }
-  };
-
-  const text  = msg.text.replace(/\u00A0/g, " ").trim();
+  // Privacy-safe base log: NO message text
+  const text = msg.text.replace(/\u00A0/g, " ").trim();
   const parts = text.split(/\s+/);
   const head  = (parts[0] || "").toLowerCase();
   const [cmd, mention] = head.split("@");
 
+  const baseLog = {
+    user: { id: msg.from?.id, username: msg.from?.username || null },
+    chat: { id: msg.chat?.id, type: msg.chat?.type },
+    msg:  { id: msg.message_id, date: msg.date, len: text.length }, // length only, no content
+  };
+
   if (mention && env.BOT_USERNAME && mention !== env.BOT_USERNAME.toLowerCase()) {
     slog({ ...baseLog, event: "ignored_not_our_mention" });
     return new Response("ok");
-  }
+    }
 
   if (cmd === "/cbot") {
     slog({ ...baseLog, event: "help" });
@@ -219,7 +220,7 @@ async function handleUpdate(env, upd) {
     const amtStr = parts[1];
     if (/,/.test(amtStr)) { slog({ ...baseLog, event: "reject_commas" }); return tgSend(env, msg.chat.id, "No commas in the amount, please."); }
     const amt = Number(amtStr);
-    if (!isFinite(amt) || amt <= 0) { slog({ ...baseLog, event: "invalid_amount", amtStr }); return tgSend(env, msg.chat.id, "Invalid amount."); }
+    if (!isFinite(amt) || amt <= 0) { slog({ ...baseLog, event: "invalid_amount" }); return tgSend(env, msg.chat.id, "Invalid amount."); }
 
     const base = nrm(ALIAS[parts[2]] || parts[2]);
     const quote = nrm(ALIAS[parts[3]] || parts[3]);
@@ -230,7 +231,8 @@ async function handleUpdate(env, upd) {
       const body =
         `${fmt(amt, base)} ${U(base)} ≈ ${fmt(total, quote)} ${U(quote)}\n` +
         `(1 ${U(base)} = ${fmt(px, quote)} ${U(quote)})`;
-      slog({ ...baseLog, event: "convert_ok", cmd, amt, base, quote, rate: px });
+      // log minimally: cmd + symbols + rate, no message content
+      slog({ ...baseLog, event: "convert_ok", cmd, base, quote, rate: px });
       return tgSend(env, msg.chat.id, body);
     } catch (e) {
       const em = String(e && e.message || e);
@@ -238,7 +240,7 @@ async function handleUpdate(env, upd) {
       let errCode = "PROVIDER_BUSY";
       if (em.includes("BAD_SYMBOL")) { userMsg = "Unknown symbol. Try common tickers (btc, eth, usdt, sol, etc.)."; errCode = "BAD_SYMBOL"; }
       else if (em.includes("NO_ROUTE")) { userMsg = "No price available for that pair right now. Try again, reverse the pair, or use USDT/USDC as the quote."; errCode = "NO_ROUTE"; }
-      slog({ ...baseLog, event: "convert_error", cmd, amt, base, quote, error: errCode });
+      slog({ ...baseLog, event: "convert_error", cmd, base, quote, error: errCode });
       return tgSend(env, msg.chat.id, userMsg);
     }
   }
