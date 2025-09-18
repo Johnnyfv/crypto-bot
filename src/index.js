@@ -1,4 +1,4 @@
-// Telegram crypto converter — Cloudflare Worker (privacy-safe logs)
+// Telegram crypto converter — Cloudflare Worker (privacy-safe logs + send error logging)
 // Commands:
 //   /c   <amount> <base> <quote>
 //   /cv  <amount> <base> <quote>   (alias of /c)
@@ -153,7 +153,28 @@ async function tgSend(env, chatId, text) {
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   const body = { chat_id: chatId, text };
 
-  await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(()=>{});
+  try {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok && env.LOG_SEND_ERRORS === "1") {
+      const code = r.status;
+      let desc = "";
+      try {
+        const j = await r.json();
+        desc = j?.description || "";
+        if (j?.parameters?.retry_after && code === 429) {
+          cooldownByChat.set(chatId, now() + Math.max(1, +j.parameters.retry_after) * 1000);
+        }
+      } catch {
+        desc = (await r.text().catch(()=>"" )).slice(0,120);
+      }
+      // minimal send error log: no message content, just status & chat ID
+      slog({ event: "send_err", chatId, http: code, desc: String(desc).slice(0,100) });
+    }
+  } catch (e) {
+    if (env.LOG_SEND_ERRORS === "1") {
+      slog({ event: "send_exc", chatId, err: String(e).slice(0,120) });
+    }
+  }
   return new Response("ok");
 }
 
@@ -185,22 +206,23 @@ async function handleUpdate(env, upd) {
   const msg = upd.message || upd.edited_message;
   if (!msg || typeof msg.text !== "string") return new Response("ok");
 
-  // Privacy-safe base log: NO message text
-  const text = msg.text.replace(/\u00A0/g, " ").trim();
+  const text  = msg.text.replace(/\u00A0/g, " ").trim();
   const parts = text.split(/\s+/);
   const head  = (parts[0] || "").toLowerCase();
   const [cmd, mention] = head.split("@");
 
+  // privacy-safe base log: NO message content
   const baseLog = {
     user: { id: msg.from?.id, username: msg.from?.username || null },
     chat: { id: msg.chat?.id, type: msg.chat?.type },
-    msg:  { id: msg.message_id, date: msg.date, len: text.length }, // length only, no content
+    msg:  { id: msg.message_id, date: msg.date, len: text.length },
   };
 
+  // If someone explicitly mentions a different bot, ignore.
   if (mention && env.BOT_USERNAME && mention !== env.BOT_USERNAME.toLowerCase()) {
     slog({ ...baseLog, event: "ignored_not_our_mention" });
     return new Response("ok");
-    }
+  }
 
   if (cmd === "/cbot") {
     slog({ ...baseLog, event: "help" });
@@ -231,7 +253,6 @@ async function handleUpdate(env, upd) {
       const body =
         `${fmt(amt, base)} ${U(base)} ≈ ${fmt(total, quote)} ${U(quote)}\n` +
         `(1 ${U(base)} = ${fmt(px, quote)} ${U(quote)})`;
-      // log minimally: cmd + symbols + rate, no message content
       slog({ ...baseLog, event: "convert_ok", cmd, base, quote, rate: px });
       return tgSend(env, msg.chat.id, body);
     } catch (e) {
@@ -245,6 +266,7 @@ async function handleUpdate(env, upd) {
     }
   }
 
+  // ignore everything else (saves quota)
   slog({ ...baseLog, event: "ignored_non_command" });
   return new Response("ok");
 }
